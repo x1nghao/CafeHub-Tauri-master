@@ -9,18 +9,26 @@ use r2d2_postgres::{
 };
 use rust_decimal::Decimal;
 use tauri::{State, AppHandle, Manager};
+use std::str::FromStr;
 
-type DbPool = Pool<PostgresConnectionManager<NoTls>>;
+// Helper function to get a DB connection from AppState
+fn get_db_client(state: &AppState) -> Result<r2d2::PooledConnection<PostgresConnectionManager<NoTls>>, String> {
+    let pool_guard = state.db.lock().map_err(|_| "Failed to acquire lock on database pool".to_string())?;
+    
+    if let Some(pool) = pool_guard.as_ref() {
+        pool.get().map_err(|e| format!("Failed to get DB connection: {}", e))
+    } else {
+        Err("Database not connected. Please check your configuration.".to_string())
+    }
+}
 
 #[tauri::command]
 pub fn login(
     username: String,
     password: String,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<Account, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let row = client
         .query_opt(
@@ -71,7 +79,7 @@ pub fn login(
 }
 
 #[tauri::command]
-pub fn register_user(data: RegistrationData, pool: State<DbPool>) -> Result<i32, String> {
+pub fn register_user(data: RegistrationData, state: State<AppState>) -> Result<i32, String> {
     if data.username.is_empty() || data.password.is_empty() {
         return Err("Username and password cannot be empty".to_string());
     }
@@ -88,9 +96,7 @@ pub fn register_user(data: RegistrationData, pool: State<DbPool>) -> Result<i32,
         }
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
     let current_date = Local::now().date_naive();
     let user_type: i8 = 1;
     let default_balance: Decimal = Decimal::new(0, 2);
@@ -131,7 +137,7 @@ pub fn register_user(data: RegistrationData, pool: State<DbPool>) -> Result<i32,
 pub fn update_user_password(
     user_id: i64,
     data: UpdatePasswordData,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<String, String> {
     if data.new_password.is_empty() {
         return Err("New password cannot be empty".to_string());
@@ -140,9 +146,7 @@ pub fn update_user_password(
         return Err("Current password cannot be empty".to_string());
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let row = client.query_opt(
         "SELECT password FROM account WHERE id = $1 AND user_type = 1",
@@ -201,10 +205,8 @@ pub fn update_user_password(
 }
 
 #[tauri::command]
-pub fn get_total_users(pool: State<DbPool>) -> Result<i64, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn get_total_users(state: State<AppState>) -> Result<i64, String> {
+    let mut client = get_db_client(&state)?;
     let row = client.query_opt("SELECT COUNT(*) FROM account WHERE user_type = 1", &[]);
 
     match row {
@@ -221,10 +223,8 @@ pub fn get_total_users(pool: State<DbPool>) -> Result<i64, String> {
 }
 
 #[tauri::command]
-pub fn get_new_users_this_month(pool: State<DbPool>) -> Result<i64, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn get_new_users_this_month(state: State<AppState>) -> Result<i64, String> {
+    let mut client = get_db_client(&state)?;
     let now = Local::now();
     let current_year = now.year();
     let current_month_num = now.month();
@@ -252,11 +252,9 @@ pub fn get_new_users_this_month(pool: State<DbPool>) -> Result<i64, String> {
 
 #[tauri::command]
 pub fn get_monthly_consumption_summary(
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<Vec<MonthlyConsumptionSummary>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let query = "SELECT month, SUM(amount) as total_amount FROM consumption GROUP BY month ORDER BY month ASC";
 
@@ -278,10 +276,32 @@ pub fn get_monthly_consumption_summary(
 }
 
 #[tauri::command]
-pub fn save_db_config(connection_string: String, app_handle: AppHandle) -> Result<(), String> {
+pub fn save_db_config(connection_string: String, app_handle: AppHandle, state: State<AppState>) -> Result<(), String> {
+    // 1. Save config to file
     let config_path = app_handle.path().app_config_dir().map_err(|e| e.to_string())?.join("db_config.json");
-    let config = DbConfig { connection_string };
-    config.save(&config_path).map_err(|e| format!("Failed to save config: {}", e))
+    let config = DbConfig { connection_string: connection_string.clone() };
+    config.save(&config_path).map_err(|e| format!("Failed to save config: {}", e))?;
+
+    // 2. Try to reconnect
+    let pg_config = r2d2_postgres::postgres::Config::from_str(&connection_string)
+        .map_err(|e| format!("Invalid connection string: {}", e))?;
+    let manager = PostgresConnectionManager::new(pg_config, NoTls);
+    
+    // Attempt to build new pool
+    // We use a small timeout (e.g. 3s) for this check so the UI doesn't hang for 30s on bad config
+    let new_pool = Pool::builder()
+        .max_size(10) // Restore default or desired size
+        .connection_timeout(std::time::Duration::from_secs(3))
+        .build(manager)
+        .map_err(|e| format!("Failed to create new DB pool with provided config: {}", e))?;
+
+    // 3. Update AppState
+    {
+        let mut db_guard = state.db.lock().map_err(|_| "Failed to acquire lock on database state".to_string())?;
+        *db_guard = Some(new_pool);
+    }
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -306,11 +326,9 @@ pub fn test_db_connection(connection_string: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn get_goods_consumption_share_current_month(
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<Vec<GoodsConsumptionShare>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let now = Local::now();
     let current_month_str = now.format("%Y-%m").to_string();
@@ -345,10 +363,8 @@ pub fn get_goods_consumption_share_current_month(
 }
 
 #[tauri::command]
-pub fn get_user_details(user_id: i64, pool: State<DbPool>) -> Result<Account, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn get_user_details(user_id: i64, state: State<AppState>) -> Result<Account, String> {
+    let mut client = get_db_client(&state)?;
 
     let row = client.query_opt(
         "SELECT id, username, phone, gender, join_time, balance, user_type FROM account WHERE id = $1 AND user_type = 1",
@@ -385,11 +401,9 @@ pub fn get_user_details(user_id: i64, pool: State<DbPool>) -> Result<Account, St
 #[tauri::command]
 pub fn get_user_monthly_consumption(
     user_id: i64,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<Vec<MonthlyConsumptionSummary>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let query = "
         SELECT month, SUM(amount) as total_amount
@@ -416,11 +430,9 @@ pub fn get_user_monthly_consumption(
 pub fn update_user_details(
     user_id: i64,
     data: UpdateUserData,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<String, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let mut set_clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn r2d2_postgres::postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -516,10 +528,8 @@ pub fn update_user_details(
 }
 
 #[tauri::command]
-pub fn get_all_goods(pool: State<DbPool>) -> Result<Vec<Goods>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn get_all_goods(state: State<AppState>) -> Result<Vec<Goods>, String> {
+    let mut client = get_db_client(&state)?;
 
     let query = "SELECT id, goods_name, goods_type, price, stock FROM goods";
 
@@ -539,7 +549,7 @@ pub fn get_all_goods(pool: State<DbPool>) -> Result<Vec<Goods>, String> {
 }
 
 #[tauri::command]
-pub fn add_goods(data: AddGoodsData, pool: State<DbPool>) -> Result<String, String> {
+pub fn add_goods(data: AddGoodsData, state: State<AppState>) -> Result<String, String> {
     if data.goods_name.is_empty() {
         return Err("Goods name cannot be empty".to_string());
     }
@@ -547,9 +557,7 @@ pub fn add_goods(data: AddGoodsData, pool: State<DbPool>) -> Result<String, Stri
         return Err("Price must be positive".to_string());
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let stock_value = data.stock.unwrap_or(0);
 
@@ -587,11 +595,9 @@ pub fn add_goods(data: AddGoodsData, pool: State<DbPool>) -> Result<String, Stri
 pub fn update_goods_info(
     goods_id: i32,
     data: UpdateGoodsData,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<String, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let mut set_clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn r2d2_postgres::postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -657,15 +663,13 @@ pub fn update_goods_info(
 #[tauri::command]
 pub fn recharge_balance(
     data: RechargeBalanceData,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<String, String> {
     if data.amount <= Decimal::ZERO {
         return Err("Recharge amount must be positive".to_string());
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let row = client
         .query_opt(
@@ -715,7 +719,7 @@ pub fn recharge_balance(
 }
 
 #[tauri::command]
-pub fn purchase_goods(data: PurchaseGoodsData, pool: State<DbPool>) -> Result<i32, String> {
+pub fn purchase_goods(data: PurchaseGoodsData, state: State<AppState>) -> Result<i32, String> {
     if data.items.is_empty() {
         return Err("No items provided for purchase.".to_string());
     }
@@ -729,9 +733,7 @@ pub fn purchase_goods(data: PurchaseGoodsData, pool: State<DbPool>) -> Result<i3
         }
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let mut tx = client
         .transaction()
@@ -851,10 +853,8 @@ pub fn purchase_goods(data: PurchaseGoodsData, pool: State<DbPool>) -> Result<i3
 }
 
 #[tauri::command]
-pub fn get_all_lost_items(pool: State<DbPool>) -> Result<Vec<LostItem>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn get_all_lost_items(state: State<AppState>) -> Result<Vec<LostItem>, String> {
+    let mut client = get_db_client(&state)?;
 
     let query = "
         SELECT
@@ -902,15 +902,13 @@ pub fn get_all_lost_items(pool: State<DbPool>) -> Result<Vec<LostItem>, String> 
 #[tauri::command]
 pub fn report_lost_item(
     data: ReportLostItemData,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<String, String> {
     if data.item_name.is_empty() {
         return Err("Item name cannot be empty".to_string());
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let current_date = Local::now().date_naive();
     let status: i16 = 0;
@@ -942,10 +940,8 @@ pub fn report_lost_item(
 }
 
 #[tauri::command]
-pub fn claim_lost_item(data: ClaimLostItemData, pool: State<DbPool>) -> Result<String, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn claim_lost_item(data: ClaimLostItemData, state: State<AppState>) -> Result<String, String> {
+    let mut client = get_db_client(&state)?;
 
     let current_date = Local::now().date_naive();
     let new_status: i16 = 1;
@@ -997,7 +993,7 @@ pub fn claim_lost_item(data: ClaimLostItemData, pool: State<DbPool>) -> Result<S
 }
 
 #[tauri::command]
-pub fn admin_send_message(data: SendMessageData, pool: State<DbPool>) -> Result<i32, String> {
+pub fn admin_send_message(data: SendMessageData, state: State<AppState>) -> Result<i32, String> {
     if data.message_content.is_empty() {
         return Err("Message content cannot be empty".to_string());
     }
@@ -1005,9 +1001,7 @@ pub fn admin_send_message(data: SendMessageData, pool: State<DbPool>) -> Result<
         return Err("Sender and receiver cannot be the same user".to_string());
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let sender_exists = client
         .query_opt("SELECT id FROM account WHERE id = $1", &[&data.sender_id])
@@ -1060,15 +1054,13 @@ pub fn admin_send_message(data: SendMessageData, pool: State<DbPool>) -> Result<
 #[tauri::command]
 pub fn customer_send_message(
     data: CusSendMessageData,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<i32, String> {
     if data.message_content.is_empty() {
         return Err("Message content cannot be empty".to_string());
     }
 
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let admin_id_row = client.query_opt("SELECT id FROM account WHERE user_type = 0 LIMIT 1", &[]);
     
@@ -1144,11 +1136,9 @@ pub fn customer_send_message(
 #[tauri::command]
 pub fn get_sent_messages(
     user_id: i64,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<Vec<MessageInfo>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let query = "
         SELECT
@@ -1184,11 +1174,9 @@ pub fn get_sent_messages(
 #[tauri::command]
 pub fn get_recived_messages(
     user_id: i64,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<Vec<MessageInfo>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let query = "
         SELECT
@@ -1225,11 +1213,9 @@ pub fn get_recived_messages(
 pub fn mark_message_as_read(
     data: MarkReadData,
     current_user_id: i64,
-    pool: State<DbPool>,
+    state: State<AppState>,
 ) -> Result<i32, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+    let mut client = get_db_client(&state)?;
 
     let row = client.query_opt(
         "SELECT receiver_id, read_status FROM message WHERE id = $1",
@@ -1307,10 +1293,8 @@ pub fn mark_message_as_read(
 }
 
 #[tauri::command]
-pub fn get_all_users(pool: State<DbPool>) -> Result<Vec<UserBasicInfo>, String> {
-    let mut client = pool
-        .get()
-        .map_err(|e| format!("Failed to get DB connection: {}", e))?;
+pub fn get_all_users(state: State<AppState>) -> Result<Vec<UserBasicInfo>, String> {
+    let mut client = get_db_client(&state)?;
 
     let query = "SELECT id, username FROM account ORDER BY id ASC";
 

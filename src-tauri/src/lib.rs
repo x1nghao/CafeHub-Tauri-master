@@ -3,9 +3,12 @@ mod db_config;
 mod models;
 
 use db_config::DbConfig;
+use models::AppState;
 use r2d2::Pool;
 use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::Duration;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -16,19 +19,47 @@ pub fn run() {
             let app_handle = app.handle();
             // Ensure config directory exists
             // We use unwrap_or_else to fallback if path resolution fails, though unlikely on desktop
-            let config_dir = app_handle.path().app_config_dir().expect("Failed to get app config dir");
+            let config_dir = app_handle
+                .path()
+                .app_config_dir()
+                .expect("Failed to get app config dir");
             let config_path = config_dir.join("db_config.json");
-            
+
             let db_config = DbConfig::load(&config_path);
             println!("Loading DB config from: {:?}", config_path);
             println!("Connection string: {}", db_config.connection_string);
 
-            let config = r2d2_postgres::postgres::Config::from_str(&db_config.connection_string)
-                .expect("Invalid database configuration");
-            let manager = PostgresConnectionManager::new(config, NoTls);
-            let pool = Pool::new(manager).expect("Failed to create DB pool.");
+            let mut pool_option = None;
 
-            app.manage(pool);
+            match r2d2_postgres::postgres::Config::from_str(&db_config.connection_string) {
+                Ok(config) => {
+                    let manager = PostgresConnectionManager::new(config, NoTls);
+                    // Use build instead of new to catch errors without panicking
+                    // Set a short timeout (e.g. 2s) for startup check to avoid long wait if DB is down
+                    match Pool::builder()
+                        .connection_timeout(Duration::from_secs(2))
+                        .build(manager) {
+                        Ok(pool) => {
+                            println!("Database connection established successfully.");
+                            pool_option = Some(pool);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create DB pool: {}", e);
+                            // Do not panic, just log the error. The app will start with pool_option = None.
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Invalid database configuration string: {}", e);
+                }
+            }
+
+            // Initialize AppState with the pool (or None)
+            let app_state = AppState {
+                db: Mutex::new(pool_option),
+            };
+
+            app.manage(app_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

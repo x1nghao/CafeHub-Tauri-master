@@ -32,7 +32,7 @@ const DBConfigPage = () => {
     setLoading(true);
     try {
       await invoke('save_db_config', { connectionString: values.connectionString });
-      message.success('配置已保存，请重启应用以生效！', 5);
+      message.success('配置已保存并立即生效！', 5);
     } catch (error: any) {
       console.error('Failed to save config:', error);
       message.error('保存失败: ' + (error.message || error));

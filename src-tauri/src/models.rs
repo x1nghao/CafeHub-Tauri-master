@@ -1,6 +1,17 @@
 use chrono::NaiveDate;
+use r2d2::Pool;
+use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+
+// Define DbPool type alias
+pub type DbPool = Pool<PostgresConnectionManager<NoTls>>;
+
+// Define AppState to wrap the optional pool
+pub struct AppState {
+    pub db: Mutex<Option<DbPool>>,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Account {
