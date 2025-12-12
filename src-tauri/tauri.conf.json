@@ -33,7 +33,7 @@
       },
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["zh-CN"],
+        "languages": ["SimpChinese"],
         "displayLanguageSelector": true
       }
     }
