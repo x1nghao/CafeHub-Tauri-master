@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --coffee-600: #6F4E37;
+  --coffee-500: #7a5740;
+  --coffee-300: #C4A484;
+  --bg-soft: #F9F6F2;
+  --text-main: #3f3a34;
+  --radius-md: 12px;
+  --space-4: 16px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.page-fade {
+  opacity: 0;
+}
+
+.page-fade-in {
+  animation: fadeIn 0.3s ease forwards;
+}
+
+.ant-btn {
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+.ant-btn:hover {
+  transform: translateY(-1px);
+}
+.ant-btn:active {
+  transform: translateY(0);
+}
+
+.ant-card {
+  border-radius: var(--radius-md);
+}
+
+.gap-16px { gap: 16px; }
